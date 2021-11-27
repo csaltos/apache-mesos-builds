@@ -25,6 +25,7 @@ TARGET_IMAGE=$TARGET_BASE/$BUILD_IMAGE_NAME
 TARGET_MESOS_REPO=$TARGET_IMAGE/mesos-repo
 
 OUTPUT=$BASE_DIR/output
+OUTPUT_PACKAGE=$OUTPUT/mesos-$MESOS_LABEL_VERSION-$BUILD_IMAGE_NAME.deb
 
 rm -rf $TARGET_BASE
 mkdir -p $TARGET_BASE
@@ -46,4 +47,6 @@ MESOS_LABEL_VERSION=$(grep "AC_INIT..mesos.," $TARGET_MESOS_REPO/configure.ac | 
 
 docker build -t mesos-build-$BUILD_IMAGE_NAME $TARGET_IMAGE
 
-docker run -it mesos-build-debian-buster:latest cat /builder/mesos-deb-packaging/pkg.deb > $OUTPUT/mesos-$MESOS_LABEL_VERSION-$BUILD_IMAGE_NAME.deb
+docker run -it mesos-build-debian-buster:latest cat /builder/mesos-deb-packaging/pkg.deb > $OUTPUT_PACKAGE
+
+echo "Apache Mesos $MESOS_LABEL_VERSION is at $OUTPUT_PACKAGE"
