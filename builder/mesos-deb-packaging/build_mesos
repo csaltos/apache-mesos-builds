@@ -342,18 +342,10 @@ function find_gem_bin {
 }
 
 function deb_ {
-  local libcurl_package
-  case "$linux" in
-    ubuntu/18*) libcurl_package="libcurl4" ;;
-    *)          libcurl_package="libcurl3" ;;
-  esac
-
   local opts=( -t deb
                --deb-recommends zookeeper
                --deb-recommends zookeeperd
                --deb-recommends zookeeper-bin
-               -d 'java-runtime-headless | java2-runtime-headless | default-jre'
-               -d $libcurl_package
                -d libevent-dev
                -d libsvn1
                -d libsasl2-modules
