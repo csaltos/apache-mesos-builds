@@ -1,0 +1,569 @@
+#!/bin/bash
+set -o errexit -o nounset -o pipefail
+export LC_ALL=C
+function -h {
+cat <<USAGE
+ USAGE: build_mesos (--repo <git URL>)?
+                    (--nominal-version <version>)?
+                    (--build-version <debian_revision or rpm release>)?
+                    (--configure-flags <extra configure flags for Mesos>)?
+
+  Performs a build in ./mesos-repo after checking out a recent copy of Mesos.
+  The default is to checkout:
+
+    $repo
+
+  You can specify a different Mesos Git URL with \`--repo'. Note that it does
+  not work to use an \`='; the \`--repo' option must be separated from the Git
+  URL with a space.
+
+  Nominal version is the Mesos major.minor.patch version and is autodetected
+  from the repository checkout. The detected version can be overridden with
+  --nominal-version.
+
+  Build version is an additional version string used for package releases. For
+  debian packages this is known as the 'debian revision' and for rpm packages
+  it is known as the 'rpm release version'. By default this is set to a
+  snapshot timestamp schema of the form: 0.1.%Y%m%d%H%M%S. Here are some
+  examples of what this might look like:
+
+    * Snapshot build:                   0.1.20140809173810
+    * Mesos release candidate 1:        0.2.rc1
+    * Mesos release candidate 2:        0.3.rc2
+    * Mesos release:                    1.0
+    * Mesos release with packaging fix: 1.1
+
+  The repo can be given as ...?ref=prod7 or even ...?prod7 to select a
+  particular branch to build.
+
+  Rather than have this script perform all the build steps, you can point it at
+  all or part of an exsting build and have it go from there. Use \`--src-dir' to
+  specify the code checkout to use. \`--build-dir' to specify where 'make'
+  should be run from. If you have already run built mesos in that directory,
+  then you can use \`--prebuilt' to tell the script to just run make install
+  inside the build directory to make the package. Use \`--configure-flags'
+  to specify extra flags to be passed to Mesoc configure script.
+
+USAGE
+}; function --help { -h ;}
+
+function globals {
+  this="$(cd "$(dirname "$0")" && pwd -P)"
+  name=mesos
+  build_version="0.1.$(date -u +'%Y%m%d%H%M%S')"
+  repo=https://gitbox.apache.org/repos/asf/mesos.git
+  use_git_version=false
+  prebuilt=false
+  extra_libs=''
+  configure_flags=""
+  rename=false
+}; globals
+
+function as_absolute {
+  if [[ "$1" == /* ]]; then
+    echo "$1"
+  else
+    echo "$start_dir/$1"
+  fi
+}
+
+function main {
+  while [[ $# -gt 0 ]]
+  do
+    case "$1" in                                      # Munging globals, beware
+      --src-dir)                src_dir="$2"       ; shift 2 ;;
+      --build-dir)              build_dir="$2"     ; shift 2 ;;
+      --prebuilt)               prebuilt=true      ; shift 1 ;;
+      --rename)                 rename=true      ; shift 1 ;;
+      --repo)                   repo="$2"          ; shift 2 ;;
+      --branch)                 branch="$2"        ; shift 2 ;;
+      --nominal-version)        version="$2"       ; shift 2 ;;
+      --build-version)          build_version="$2" ; shift 2 ;;
+      --extra-libs)             extra_libs="$2"    ; shift 2 ;;
+      --configure-flags)        configure_flags="$2"    ; shift 2 ;;
+      *)                        err 'Argument error. Please see help.' ;;
+    esac
+  done
+
+  : "${src_dir:=mesos-repo}"
+  : "${build_dir:=$src_dir/build}"
+
+  src_dir=$(as_absolute "$src_dir")
+  build_dir=$(as_absolute "$build_dir")
+
+  # Use the more specific dir, e.g. centos/6 will be used over centos if present
+  if [[ -d "$this/$linux" ]]
+  then asset_dir="$linux"
+  elif [[ -d "$this/${linux%%/*}" ]]
+  then asset_dir="${linux%%/*}"
+  else err "Unable to determine asset_dir for $linux"; exit 1
+  fi
+
+  if ! $prebuilt; then
+    checkout
+  fi
+  version=${version:-"$(mesos_version)"}      # Set from checkout if no version
+  ( cd "$src_dir" && go )
+}
+
+function go {
+  if ! $prebuilt; then
+    build
+  fi
+  create_installation
+  create_lib_symlinks
+  pkg
+  if [[ ! $(configure_opts) =~ "--disable-python\>" ]]
+  then
+    save_python_egg
+  fi
+}
+
+function mesos_version {
+  local configure_ac="$src_dir"/configure.ac
+  if [[ -f "$configure_ac" ]]
+  then
+    # Error if AC_INIT is not found or extracted version does not match pattern
+    local ac_init=$(grep '^AC_INIT(\[mesos\], \[' "$configure_ac")
+    if [[ ! "$ac_init" =~ .*([0-9]+\.[0-9]+\.[0-9]+).* ]]
+    then
+      err "Unable to extract Mesos version from: ${configure_ac}"
+      exit 1
+    fi
+    out "${BASH_REMATCH[1]}"
+  else
+    err "Unable to find ${configure_ac}; checkout required"
+    exit 1
+  fi
+}
+
+function maybe_append_git_hash {
+  if $use_git_version && git rev-parse --git-dir &>/dev/null
+  then out "$1-g$(git log -n1 --format=%h)"
+  else out "$1"
+  fi
+}
+
+function checkout {
+  local url=( $(url_split "$repo") )
+  local repository="${url[0]}"
+  local query="${url[1]:-}"
+  if [[ ${url[2]:-} ]]
+  then err "Setting fragment (#) does nothing. Try query (?) instead."
+  fi
+  case "$query" in
+    ref=*|h=*|branch=*|tag=*) local ref="${query#*=}" ;;
+    *)                        local ref="$query" ;;
+  esac
+  if [[ -d "$src_dir" ]]
+  then msg "Found directory \`$src_dir'; skipping checkout."
+  else msg "Cloning: $repository at $ref" && git clone "$repository" "$src_dir"
+  fi
+  ( cd "$src_dir" && ( [[ ! ${ref:-} ]] || git checkout -f "$ref" ) && "$@" )
+}
+
+function build {(
+  export LD_RUN_PATH=/usr/lib/mesos
+  autoreconf -f -i -Wall,no-obsolete
+  ./bootstrap
+  mkdir -p "$build_dir"
+  cd "$build_dir"
+
+  # A bug in Autoconf 2.64 and earlier causes `AC_CONFIG_LINKS(src/a/b:src/c/d)`
+  # to create symlink 'src/a/b' that points to 'src/c/d' instead of pointing to
+  # '../../src/c/d'. This bug is triggered only when invoking configure script
+  # with an absolute path. Thus, we use relative invocation here.
+  # http://git.savannah.gnu.org/cgit/autoconf.git/commit/?id=13e3570
+  #
+  # Since we know that "$src_dir" is an absolute path, we use a poor man's
+  # method to compute relative path by first computing the relative path to '/'
+  # and then appending "$src_dir" to it.
+  if [ $(realpath --relative-to=. $src_dir 2>/dev/null) ]; then
+    rel_src_dir=$(realpath --relative-to=. $src_dir)
+  else
+    rel_src_dir=$(pwd | sed -e's:/[^/]\+:../:g')$src_dir
+  fi
+
+  "$rel_src_dir"/configure $(configure_opts)
+  make
+)}
+
+function os_release {
+  msg "Trying /etc/os-release..."
+  if [[ -f /etc/os-release ]]
+  then
+    ( source /etc/os-release && display_version "$ID" "$VERSION_ID" )
+    return 0
+  fi
+  msg "Trying /etc/redhat-release..."
+  if [[ -f /etc/redhat-release ]]
+  then
+    # Seems to be formatted as: <distro> release <version> (<remark>)
+    #                           CentOS release 6.3 (Final)
+    if [[ $(cat /etc/redhat-release) =~ \
+          ^(.+)' '+release' '+([^ ]+)' '+'('[^')']+')'$ ]]
+    then
+      local os
+      case "${BASH_REMATCH[1]}" in
+        'Red Hat '*) os=RedHat ;;
+        *)           os="${BASH_REMATCH[1]}" ;;
+      esac
+      display_version "$os" "${BASH_REMATCH[2]}"
+      return 0
+    else
+      err "/etc/redhat-release not like: <distro> release <version> (<remark>)"
+    fi
+  fi
+  if which sw_vers &> /dev/null
+  then
+    local product="$(sw_vers -productName)"
+    case "$product" in
+      'Mac OS X') display_version MacOSX "$(sw_vers -productVersion)" ;;
+      *) err "Expecting productName to be 'Mac OS X', not '$product'!";;
+    esac
+    return 0
+  fi
+  err "Could not determine OS version!"
+}
+
+function display_version {
+  local os="$( tr A-Z a-z <<<"$1" )" version="$( tr A-Z a-z <<<"$2" )"
+  case "$os" in
+    redhat|rhel|centos|debian|fedora) out "$os/${version%%.*}" ;;   # Ignore minor versions
+    macosx)               out "$os/${version%.*}" ;;  # Ignore bug fix releases
+    *)                    out "$os/$version" ;;
+  esac
+}
+
+function create_installation {(
+  local pwd="$(pwd -P)"
+  mkdir -p toor
+  ( cd "$build_dir" && make install DESTDIR="$pwd"/toor )
+  cd toor
+  mkdir -p usr/share/doc/mesos etc/default etc/mesos var/log/mesos
+  mkdir -p etc/mesos-master etc/mesos-slave var/lib/mesos
+  cp ../CHANGELOG                usr/share/doc/mesos/
+  cp "$this"/default/mesos*      etc/default/
+  echo zk://localhost:2181/mesos > etc/mesos/zk
+  if [[ $(vercomp "$version" 0.19.0) == '>' ]] ||
+     [[ $(vercomp "$version" 0.19.0) == '=' ]]
+  then
+    echo /var/lib/mesos          > etc/mesos-master/work_dir
+    echo 1                       > etc/mesos-master/quorum
+    echo /var/lib/mesos          > etc/mesos-slave/work_dir
+  fi
+  extra_libs
+  init_scripts "$linux"
+  if [[ ! $(configure_opts) =~ "--disable-java\>" ]]
+  then
+    jars
+  fi
+)}
+
+function create_lib_symlinks {(
+  if [[ -f usr/lib64/libmesos.so ]]; then
+    libdir=lib64
+  else
+    libdir=lib
+  fi
+  cd toor
+  if [[ ! -d usr/local/lib ]]
+  then
+    msg "Create symlinks for backwards compatibility (e.g. Marathon currently"
+    msg "expects libmesos.so to exist in /usr/local/lib)."
+    mkdir -p usr/local/lib
+    # ensure symlinks are relative so they work as expected in the final env
+    ( cd usr/local/lib && cp -s ../../$libdir/lib*.so . )
+  fi
+)}
+
+function init_scripts {
+  mkdir -p usr/bin
+  cp -p "$this"/mesos-init-wrapper usr/bin
+  case "$1" in
+    fedora/*|redhat/7|redhat/7.*|centos/7|centos/7.*|rhel/7|rhel/7.*|opensuse/*)
+      mkdir -p usr/lib/systemd/system
+      cp "$this"/systemd/master.systemd usr/lib/systemd/system/mesos-master.service
+      cp "$this"/systemd/slave.systemd usr/lib/systemd/system/mesos-slave.service ;;
+    debian/8*|debian/9*|ubuntu/15*|ubuntu/16*|ubuntu/17*|ubuntu/18*)
+      mkdir -p lib/systemd/system
+      cp "$this"/systemd/master.systemd lib/systemd/system/mesos-master.service
+      cp "$this"/systemd/slave.systemd lib/systemd/system/mesos-slave.service ;;
+    debian/*)
+      mkdir -p etc/init.d
+      cp -p "$this"/init/master.init etc/init.d/mesos-master
+      cp -p "$this"/init/slave.init etc/init.d/mesos-slave ;;
+    ubuntu/*|redhat/6|redhat/6.*|centos/6|centos/6.*)
+      mkdir -p etc/init
+      cp "$this"/upstart/master.upstart etc/init/mesos-master.conf
+      cp "$this"/upstart/slave.upstart etc/init/mesos-slave.conf ;;
+    *) err "Not sure how to make init scripts for: $1" ;;
+  esac
+}
+
+function extra_libs {
+  if [ -n "$extra_libs" ]
+  then
+    mkdir -p usr/lib/mesos
+    IFS=";"
+    for lib in $extra_libs
+    do
+      cp -f $lib usr/lib/mesos/
+    done
+  fi
+}
+
+function jars {
+  mkdir -p usr/share/java/
+  if [[ -d "$build_dir"/src/java/target ]]
+  then mv "$build_dir"/src/java/target/mesos-*.jar usr/share/java # Mesos >= 0.18.1
+  else mv "$build_dir"/src/mesos-*.jar usr/share/java             # Mesos <  0.18.1
+  fi
+}
+
+function pkg {
+  case "$linux" in
+    ubuntu/*|debian/*) deb_ ;;
+    centos/*|redhat/*|rhel/*|fedora/*|opensuse/*) rpm_ ;;
+    *)                 err "Not sure how to package for: $linux" ;;
+  esac
+}
+
+function architecture {
+  case "$linux" in
+    ubuntu/*|debian/*) dpkg-architecture -qDEB_BUILD_ARCH ;;
+    centos/*|redhat/*|rhel/*|fedora/*|opensuse/*) arch ;;
+    *)                 err "Not sure how to determine arch for: $linux" ;;
+  esac
+}
+
+function find_gem_bin {
+  gem env | sed -n '/^ *- EXECUTABLE DIRECTORY: */ { s/// ; p }'
+}
+
+function deb_ {
+  local libcurl_package
+  case "$linux" in
+    ubuntu/18*) libcurl_package="libcurl4" ;;
+    *)          libcurl_package="libcurl3" ;;
+  esac
+
+  local opts=( -t deb
+               --deb-recommends zookeeper
+               --deb-recommends zookeeperd
+               --deb-recommends zookeeper-bin
+               -d 'java-runtime-headless | java2-runtime-headless | default-jre'
+               -d $libcurl_package
+               -d libevent-dev
+               -d libsvn1
+               -d libsasl2-modules
+               -d libcurl4-openssl-dev
+               --after-install "$this/$asset_dir/mesos.postinst"
+               --after-remove "$this/$asset_dir/mesos.postrm" )
+  pkgname="pkg"
+  if $rename; then
+    os_tag=${linux//[\/.]/} # convert "ubuntu/14.04" to "ubuntu1404"
+    pkgname="mesos_${version}-${build_version}.${os_tag}_${arch}"
+  fi
+
+  rm -f "$this"/"$pkgname".deb
+  fpm_ "${opts[@]}" -p "$this"/"$pkgname".deb
+}
+
+function rpm_ {
+
+  case "$linux" in
+    centos/6|rhel/6) os_tag=el6; libevent_devel_pkg=libevent2-devel ;;
+    centos/7|rhel/7) os_tag=el7; libevent_devel_pkg=libevent-devel ;;
+    opensuse/*)      os_tag=${linux//[\/.]/}; libevent_devel_pkg=libevent-devel ;;
+    *)        err "Unknown CentOS distribution: $linux" ;;
+  esac
+
+  local opts=( -t rpm
+               -d libcurl
+               -d subversion
+               -d cyrus-sasl-md5
+               -d $libevent_devel_pkg
+               --after-install "$this/$asset_dir/mesos.postinst"
+               --after-remove "$this/$asset_dir/mesos.postrm" )
+
+  pkgname="pkg"
+  if $rename; then
+    pkgname="mesos-${version}-${build_version}.${os_tag}.${arch}"
+  fi
+  rm -f "$this"/"$pkgname".rpm
+  fpm_ "${opts[@]}" -p "$this"/"$pkgname".rpm
+}
+
+# Doesn't actually work the same as the others...
+function osx_ {(
+  arch=x86_64
+  gem_bin=/usr/bin
+  fpm_ -t osxpkg --osxpkg-identifier-prefix org.apache
+)}
+
+function fpm_ {
+  local version="$(maybe_append_git_hash "$version")"
+
+  case "$linux" in
+    centos/6|rhel/6) os_tag=el6 ;;
+    centos/7|rhel/7) os_tag=el7 ;;
+    *)               os_tag=${linux//[\/.]/} ;;
+  esac
+
+  iteration=${build_version}
+  if $rename; then
+    iteration="${iteration}.${os_tag}"
+  fi
+
+  local opts=( -s dir
+               -n "$name"
+               -v "$version"
+               --iteration "${iteration}"
+               --description
+"Cluster resource manager with efficient resource isolation
+Apache Mesos is a cluster manager that offers efficient resource isolation
+and sharing across distributed applications, or frameworks. It can run
+Hadoop, MPI, Hypertable, Spark (a new framework for low-latency interactive
+and iterative jobs), and other applications."
+               --url=https://mesos.apache.org/
+               --license Apache-2.0
+               -a "$arch"
+               --category misc
+               --vendor ""
+               -m dev@mesos.apache.org
+               --config-files etc/
+               --prefix=/ )
+  export PATH="$gem_bin":$PATH
+  ( cd toor && fpm "${opts[@]}" "$@" -- . )
+}
+
+function save_python_egg {
+  local python_dist="$build_dir"/src/python/dist
+  if ls -d "$build_dir"/src/python/native/dist/*.egg &>/dev/null
+  then
+    # Eggs were found in the old location, use that instead
+    python_dist="$build_dir"/src/python/native/dist
+  fi
+  local eggs=( "$python_dist"/*.egg )
+  cp "${eggs[@]}" "$this"/
+  if [[ $(vercomp "$version" 0.20.0) == '<' ]]
+  then
+    # Old way to create the distribution egg
+    cat "${eggs[@]}" > "$this"/mesos.egg
+  else
+    # Distribute mesos.native (mesos.interface can be found on pypi)
+    cp "$this"/mesos.native*.egg "$this"/mesos.egg
+  fi
+}
+
+function upload {
+  local pkg="$name"_"$version"_"$arch".deb
+  local url="${1%/}"/"$linux"/"$pkg"
+  curl -X PUT "$url" --data-binary @"$2" >/dev/null
+  out "$url"
+}
+
+function get_system_info {
+  linux="$(os_release)"                 # <distro>/<version>, like ubuntu/12.10
+  arch="$(architecture)"          # In the format used to label distro packages
+  gem_bin="$(find_gem_bin)"                          # Might not be on the PATH
+  start_dir="$PWD"
+}
+
+function url_fragment {
+  local step1="${1%#}"#       # Ensure URL ends in #, even if it has a fragment
+  local step2="${step1#*#}"                                # Clip up to first #
+  out "${step2%#}"                    # Remove trailing #, guaranteed by step 1
+}
+
+# Split URL in to resource, query and fragment.
+function url_split {
+  local fragment= query=
+  local sans_fragment="${1%%#*}"
+  local sans_query="${sans_fragment%%'?'*}"
+  [[ $1             = $sans_fragment ]] || fragment="${1#*#}"
+  [[ $sans_fragment = $sans_query    ]] || query="${sans_fragment#*'?'}"
+  out "$sans_query"
+  out "$query"
+  out "$fragment"
+}
+
+# Return Mesos configuration options
+function configure_opts {
+  local options="--prefix=/usr"
+  if [[ "$version" == 0.18.0-rc4 ]] || [[ "$repo" =~ 0\.18\.0-rc4$ ]]
+  then options+=" --without-cxx11"                # See: MESOS-750 and MESOS-1095
+  fi
+  if [[ $(vercomp "$version" 0.21.0) == '>' ]] ||
+     [[ $(vercomp "$version" 0.21.0) == '=' ]]
+  then options+=" --enable-optimize"
+  fi
+
+  # Pass on any configure flags to Mesos configure script.
+  options+=" $configure_flags"
+
+  # Do not auto-install python dependencies. This can cause the
+  # package to overwrite system installed packages such as setuptools
+  # and python-protobuf. Instead, we should explicitly list specific
+  # python dependencies.
+  options+=" --disable-python-dependency-install"
+
+  out "$options"
+}
+
+# Compares version strings $1 with $2 and prints '=', '>', or '<'
+# Only works if compared strings have the same number of positions, for example:
+#   vercomp 0.19    0.2   # good
+#   vercomp 0.19.0  0.2.0 # good
+#   vercomp 0.19.0  0.2   # bad
+# Adapted from: http://stackoverflow.com/a/4025065/3389824
+function vercomp {
+  if [[ $1 == $2 ]]
+  then
+    out '='
+    return
+  fi
+  local IFS=.
+  local i ver1=($1) ver2=($2)
+  # fill empty fields in ver1 with zeros
+  for ((i=${#ver1[@]}; i<${#ver2[@]}; i++))
+  do
+    ver1[i]=0
+  done
+  for ((i=0; i<${#ver1[@]}; i++))
+  do
+    if [[ -z ${ver2[i]} ]]
+    then
+      # fill empty fields in ver2 with zeros
+      ver2[i]=0
+    fi
+    if ((10#${ver1[i]} > 10#${ver2[i]}))
+    then
+      out '>'
+      return
+    fi
+    if ((10#${ver1[i]} < 10#${ver2[i]}))
+    then
+      out '<'
+      return
+    fi
+  done
+  out =
+}
+
+function msg { out "$*" >&2 ;}
+function err { local x=$? ; msg "$*" ; return $(( $x == 0 ? 1 : $x )) ;}
+function out { printf '%s\n' "$*" ;}
+
+if [[ ${1:-} ]] && declare -F | cut -d' ' -f3 | fgrep -qx -- "${1:-}"
+then
+  case "$1" in
+    -h|--help|go|url_split|create_installation|checkout|build|osx_) : ;;
+    *) get_system_info ;;
+  esac
+  "$@"
+else
+  get_system_info
+  main "$@"
+fi
