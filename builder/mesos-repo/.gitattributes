@@ -1,5 +1,0 @@
-# Set `core.autocrlf = true` for this repo.
-* text=auto
-
-# Treat patch files as text.
-*.patch text
